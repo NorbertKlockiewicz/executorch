@@ -106,6 +106,7 @@ class Lfm2p5Vl(torch.nn.Module):
             size=(FIXED_H, FIXED_W),
             mode="bilinear",
             align_corners=False,
+            antialias=True,
         )
         # .contiguous() prevents dim_order mismatches in portable aten::add.out kernel
         precomputed_pe = (
@@ -183,7 +184,7 @@ class Lfm2p5Vl(torch.nn.Module):
         x = nchw_pixels / 255.0
         x = (x - 0.5) / 0.5
 
-        # Extract 16x16 patches in HW-major order -> [1, 1024, 768]
+        # Extract 16x16 patches in HW-major order -> [1, 1024, PATCH_SIZE*PATCH_SIZE*3]
         x = x.unfold(2, PATCH_SIZE, PATCH_SIZE).unfold(3, PATCH_SIZE, PATCH_SIZE)
         x = x.permute(0, 2, 3, 4, 5, 1).reshape(1, FIXED_H * FIXED_W, PATCH_SIZE * PATCH_SIZE * 3)
 
@@ -194,7 +195,7 @@ class Lfm2p5Vl(torch.nn.Module):
             spatial_shapes=torch.tensor([[FIXED_H, FIXED_W]], dtype=torch.int64),
             return_dict=True,
         )
-        feats = out.last_hidden_state  # [1, 1024, 768]
+        feats = out.last_hidden_state  # [1, 1024, vision_hidden_size]
         feats = feats.reshape(feats.shape[0], FIXED_H, FIXED_W, -1)
         projected = self.model_.model.multi_modal_projector(feats)  # [1, 16, 16, 2048]
         return projected.reshape(1, -1, projected.shape[-1])        # [1, 256, 2048]
@@ -316,4 +317,4 @@ class Lfm2p5VlModel(EagerModelBase):
 
     def _get_prompt_dynamic_shapes(self):
         dim = Dim("token_dim", min=1, max=self.max_seq_len)
-        return ({1: dim}, {0: dim})
+        return ({1: dim}, {1: dim})
