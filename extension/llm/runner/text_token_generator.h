@@ -109,6 +109,14 @@ class ET_EXPERIMENTAL TextTokenGenerator {
             tokens_managed, {1, static_cast<int>(token_data.size())}));
       }
 
+      // data-dependent terminating condition: stop before decoding/emitting
+      // the EOS token so it never appears in the output.
+      if (eos_ids_->find(cur_token) != eos_ids_->end()) {
+        printf("\n");
+        ET_LOG(Info, "\nReached to the end of generation");
+        break;
+      }
+
       // print the token as string, decode it with the Tokenizer object
       auto decode_result = tokenizer_->decode(prev_token, cur_token);
       if (!decode_result.ok()) {
@@ -121,13 +129,6 @@ class ET_EXPERIMENTAL TextTokenGenerator {
       token_callback(std::move(*decode_result));
 
       if (should_stop_) {
-        break;
-      }
-
-      // data-dependent terminating condition: we have n_eos_ number of EOS
-      if (eos_ids_->find(cur_token) != eos_ids_->end()) {
-        printf("\n");
-        ET_LOG(Info, "\nReached to the end of generation");
         break;
       }
     }

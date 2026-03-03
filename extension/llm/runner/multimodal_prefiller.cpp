@@ -39,6 +39,9 @@ Result<uint64_t> MultimodalPrefiller::prefill(
     int64_t& start_pos) {
   // 1. Run encoder model.
   ::executorch::runtime::EValue encoder_output;
+  // Keep token embedding backing storage alive for the duration of prefill.
+  std::vector<int64_t> padded_tokens_storage;
+  executorch::extension::TensorPtr sliced_embed_storage;
   if (input.is_image()) {
     const Image& image = input.get_image();
 
@@ -69,11 +72,13 @@ Result<uint64_t> MultimodalPrefiller::prefill(
           image.is_uint8(),
           InvalidArgument,
           "Model expects uint8_t image data, but image has float data.");
-    } else if (expected_dtype == ::executorch::aten::ScalarType::BFloat16) {
+    } else if (
+        expected_dtype == ::executorch::aten::ScalarType::Half ||
+        expected_dtype == ::executorch::aten::ScalarType::BFloat16) {
       ET_CHECK_OR_RETURN_ERROR(
           image.is_float(),
           InvalidArgument,
-          "Model expects BFloat16 data, we need to take image in float32 type and convert afterwards. But now image has uint8_t data.");
+          "Model expects Half/BFloat16 data; image must be float32 for conversion. But image has uint8_t data.");
     } else {
       ET_CHECK_OR_RETURN_ERROR(
           false,
@@ -91,7 +96,14 @@ Result<uint64_t> MultimodalPrefiller::prefill(
         image_tensor_result.error(), "Failed to convert image to tensor");
     auto image_tensor = image_tensor_result.get();
 
-    if (expected_dtype == ::executorch::aten::ScalarType::BFloat16) {
+    if (expected_dtype == ::executorch::aten::ScalarType::Half) {
+      // Convert to float16 for model input
+      auto image_tensor_return = convert_to_half(image_tensor);
+      ET_CHECK_OK_OR_RETURN_ERROR(
+          image_tensor_return.error(),
+          "Failed to convert image tensor to half");
+      image_tensor = image_tensor_return.get();
+    } else if (expected_dtype == ::executorch::aten::ScalarType::BFloat16) {
       // Convert to bfloat16 for model input
       auto image_tensor_return = convert_to_bfloat16(image_tensor);
       ET_CHECK_OK_OR_RETURN_ERROR(
@@ -189,9 +201,24 @@ Result<uint64_t> MultimodalPrefiller::prefill(
       tokens = input.get_tokens();
     }
 
+    const auto actual_seq_len =
+        static_cast<aten::SizesType>(tokens.size());
+
+    // The token_embedding PTE has a fixed-size input buffer (MAX_SEQ_LEN).
+    // Pad with zeros to fill it, then slice the output back to actual length.
+    int64_t max_seq_len = actual_seq_len; // fallback: no padding needed
+    auto max_seq_len_result = module_->get(kMaxSeqLen);
+    if (max_seq_len_result.error() == ::executorch::runtime::Error::Ok) {
+      max_seq_len = max_seq_len_result.get().toScalar().to<int64_t>();
+    }
+
+    // Use the function-scope storage so it outlives this if-block.
+    padded_tokens_storage.assign(max_seq_len, 0);
+    std::copy(tokens.begin(), tokens.end(), padded_tokens_storage.begin());
+
     auto text_tensor = executorch::extension::from_blob(
-        tokens.data(),
-        {1, static_cast<aten::SizesType>(tokens.size())},
+        padded_tokens_storage.data(),
+        {1, static_cast<aten::SizesType>(max_seq_len)},
         ::executorch::aten::ScalarType::Long);
 
     // Run text encoder (token embeddings)
@@ -200,7 +227,16 @@ Result<uint64_t> MultimodalPrefiller::prefill(
     ET_CHECK_OK_OR_RETURN_ERROR(token_embedding_result.error());
     auto token_embedding_outputs = token_embedding_result.get();
 
-    encoder_output = token_embedding_outputs[0];
+    // Slice output from [1, MAX_SEQ_LEN, dim] back to [1, actual_seq_len, dim]
+    // sliced_embed_storage keeps the TensorPtr alive past this block.
+    auto full_embed = token_embedding_outputs[0].toTensor();
+    const auto embed_dim =
+        static_cast<aten::SizesType>(full_embed.size(2));
+    sliced_embed_storage = executorch::extension::from_blob(
+        full_embed.mutable_data_ptr(),
+        {1, actual_seq_len, embed_dim},
+        full_embed.scalar_type());
+    encoder_output = ::executorch::runtime::EValue(*sliced_embed_storage);
   } else {
     ET_LOG(Error, "Unsupported input type");
     // For any other input types, return error
@@ -212,6 +248,8 @@ Result<uint64_t> MultimodalPrefiller::prefill(
   // Get expected shape of cache position tensor, which should be the second
   // argument
 
+  // NOTE: encoder_output.toTensor() must stay valid below — the caller is
+  // responsible for keeping any backing TensorPtr alive until after prefill.
   int64_t seq_len = encoder_output.toTensor().size(1);
   if (seq_len == 0) {
     ET_LOG(Error, "The encoder returned an empty output.");

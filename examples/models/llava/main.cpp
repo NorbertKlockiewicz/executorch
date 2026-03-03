@@ -60,16 +60,11 @@ void load_image(const std::string& image_path, Image& image) {
     ET_LOG(Fatal, "Failed to load image: %s", image_path.c_str());
     exit(1);
   }
-  // resize the longest edge to 336
-  int new_width = width;
-  int new_height = height;
-  if (width > height) {
-    new_width = 336;
-    new_height = static_cast<int>(height * 336.0 / width);
-  } else {
-    new_height = 336;
-    new_width = static_cast<int>(width * 336.0 / height);
-  }
+  // Resize to exactly 512x512 for LFM2-VL vision encoder.
+  // The exported vision_encoder expects [1, 3, 512, 512] NCHW float32 and
+  // performs normalization and patch extraction internally.
+  const int new_width = 512;
+  const int new_height = 512;
   std::vector<uint8_t> resized_data(new_width * new_height * channels);
   stbir_resize_uint8(
       data,
@@ -81,10 +76,13 @@ void load_image(const std::string& image_path, Image& image) {
       new_height,
       0,
       channels);
-  std::vector<uint8_t> chw_data(channels * new_width * new_height);
+  // Convert HWC uint8 -> CHW float32 (keep values in [0, 255] range).
+  // The vision_encoder PTE performs normalization internally.
+  std::vector<float> chw_data(channels * new_width * new_height);
   for (int i = 0; i < new_width * new_height; ++i) {
     for (int c = 0; c < channels; ++c) {
-      chw_data[c * new_width * new_height + i] = resized_data[i * channels + c];
+      chw_data[c * new_width * new_height + i] =
+          static_cast<float>(resized_data[i * channels + c]);
     }
   }
   image = Image(std::move(chw_data), new_width, new_height, channels);
@@ -154,14 +152,16 @@ int32_t main(int32_t argc, char** argv) {
   }
 
   // Prepare inputs
-  static const char* kPresetPrompt =
-      "A chat between a curious human and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the human's questions. USER: ";
+  // LFM2-VL chat template:
+  //   <|startoftext|><|im_start|>user\n<image>{prompt}<|im_end|>\n<|im_start|>assistant\n
+  static const char* kPresetPrompt = "<|startoftext|><|im_start|>user\n";
+  static const char* kPromptSuffix = "<|im_end|>\n<|im_start|>assistant\n";
   Image image;
   load_image(image_path, image);
   std::vector<MultimodalInput> inputs = {
       make_text_input(std::string(kPresetPrompt)),
       make_image_input(image),
-      make_text_input(std::string(prompt)),
+      make_text_input(std::string(prompt) + kPromptSuffix),
   };
 
   ::executorch::extension::llm::GenerationConfig config;
